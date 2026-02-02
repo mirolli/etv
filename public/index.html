@@ -5301,10 +5301,8 @@
 
                     const randomRequests = [];
                     const types = ['movie', 'tv'];
-                    // 如果开启 NSFW 过滤，移除恐怖类型 (27)
-                    const genres = this.filterNsfw
-                        ? [28, 35, 10749, 16, 80, 18, 14, 10751, 9648]  // 移除 27 (恐怖)
-                        : [28, 35, 10749, 16, 80, 18, 14, 27, 10751, 9648];
+                    // 所有类型（包括恐怖和浪漫），通过分级过滤来排除成人内容
+                    const genres = [28, 35, 10749, 16, 80, 18, 14, 27, 10751, 9648];
 
                     // 每次抓取生成 4 个不同的随机源（基于种子）
                     for (let i = 0; i < 4; i++) {
@@ -5314,8 +5312,20 @@
                         const page = Math.floor(seededRandom(baseSeed, 2) * 10) + 1;
                         const genreIndex = Math.floor(seededRandom(baseSeed, 3) * genres.length);
 
-                        // 使用固定的参数组合，确保可缓存；添加 include_adult=false 过滤成人内容
-                        const adultParam = this.filterNsfw ? '&include_adult=false' : '';
+                        // 使用固定的参数组合，确保可缓存
+                        // 添加 include_adult=false 过滤明确的成人内容
+                        // 添加分级过滤：电影 PG-13 以下，电视 TV-14 以下（排除 R 级、NC-17 等情色内容）
+                        let adultParam = '';
+                        if (this.filterNsfw) {
+                            adultParam = '&include_adult=false';
+                            if (type === 'movie') {
+                                // 美国电影分级：G, PG, PG-13, R, NC-17，只显示 PG-13 及以下
+                                adultParam += '&certification_country=US&certification.lte=PG-13';
+                            } else {
+                                // 美国电视分级：TV-Y, TV-Y7, TV-G, TV-PG, TV-14, TV-MA，只显示 TV-14 及以下
+                                adultParam += '&certification_country=US&certification.lte=TV-14';
+                            }
+                        }
                         const url = `/api/tmdb-proxy?path=${encodeURIComponent('/discover/' + type)}&page=${page}&sort_by=popularity.desc&with_genres=${genres[genreIndex]}${adultParam}`;
                         randomRequests.push(fetch(url).then(res => res.json()));
                     }
