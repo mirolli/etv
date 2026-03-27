@@ -682,8 +682,96 @@ app.use('/cache', express.static('public/cache', {
     etag: true
 }));
 
-// ⚠️ 关键：HTML 和 Service Worker 不缓存，确保用户获取最新版本
-app.get(['/', '/index.html', '/sw.js'], (req, res, next) => {
+// ========== 自动识别站点 URL ==========
+
+/**
+ * 从请求自动识别当前站点的 URL
+ * 优先级：SITE_URL 环境变量 > 请求头自动检测
+ * @param {object} req - Express 请求对象
+ * @returns {string} - 站点 URL，如 https://mysite.com（不带尾部斜杠）
+ */
+function getSiteUrl(req) {
+    // 1. 优先使用环境变量（用户显式配置的优先级最高）
+    if (process.env.SITE_URL) {
+        return process.env.SITE_URL.replace(/\/$/, '');
+    }
+    // 2. 从请求头自动检测
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+    const host = req.headers['x-forwarded-host'] || req.get('host');
+    if (host) {
+        return `${protocol}://${host}`;
+    }
+    // 3. 兜底默认值
+    return 'https://ednovas.video';
+}
+
+// 缓存读取的 index.html 原始内容（避免每次请求都读磁盘）
+let indexHtmlTemplate = null;
+let robotsTxtTemplate = null;
+
+const DEFAULT_SITE_URL = 'https://ednovas.video';
+
+// ⚠️ 关键：动态注入站点 URL 到 index.html
+// 自动将 meta 标签中的 ednovas.video 替换为当前访问的网站地址
+app.get(['/', '/index.html'], (req, res) => {
+    res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+
+    try {
+        // 懒加载模板
+        if (!indexHtmlTemplate) {
+            indexHtmlTemplate = fs.readFileSync(path.join(__dirname, 'public/index.html'), 'utf-8');
+        }
+
+        const siteUrl = getSiteUrl(req);
+
+        // 如果当前就是默认地址，不需要替换
+        if (siteUrl === DEFAULT_SITE_URL) {
+            res.type('html').send(indexHtmlTemplate);
+            return;
+        }
+
+        // 替换所有 hardcoded 的默认 URL
+        const html = indexHtmlTemplate.replace(
+            new RegExp(DEFAULT_SITE_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
+            siteUrl
+        );
+        res.type('html').send(html);
+    } catch (err) {
+        console.error('[Dynamic HTML] Error:', err.message);
+        // 回退到静态文件
+        res.sendFile(path.join(__dirname, 'public/index.html'));
+    }
+});
+
+// 动态注入站点 URL 到 robots.txt
+app.get('/robots.txt', (req, res) => {
+    try {
+        if (!robotsTxtTemplate) {
+            robotsTxtTemplate = fs.readFileSync(path.join(__dirname, 'public/robots.txt'), 'utf-8');
+        }
+
+        const siteUrl = getSiteUrl(req);
+
+        if (siteUrl === DEFAULT_SITE_URL) {
+            res.type('text').send(robotsTxtTemplate);
+            return;
+        }
+
+        const txt = robotsTxtTemplate.replace(
+            new RegExp(DEFAULT_SITE_URL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
+            siteUrl
+        );
+        res.type('text').send(txt);
+    } catch (err) {
+        console.error('[Dynamic robots.txt] Error:', err.message);
+        res.sendFile(path.join(__dirname, 'public/robots.txt'));
+    }
+});
+
+// Service Worker 不缓存
+app.get('/sw.js', (req, res, next) => {
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.set('Pragma', 'no-cache');
     res.set('Expires', '0');
@@ -987,8 +1075,39 @@ app.get('/api/search', async (req, res) => {
     const sites = getDB().sites;
 
     if (!stream) {
-        // 非流式模式：返回普通 JSON
-        return res.json({ error: 'Use stream=true for GET requests' });
+        // 非流式模式：返回聚合的 JSON 结果（用于 refreshEpisodes 查找 vod_id）
+        const siteKey = req.query.site_key;  // 可选：只搜索指定站点
+        const targetSites = siteKey ? sites.filter(s => s.key === siteKey) : sites;
+
+        const allResults = [];
+        const searchPromises = targetSites.map(async (site) => {
+            const cacheKey = `${site.key}_${keyword}`;
+            const cached = cacheManager.get('search', cacheKey);
+            if (cached && cached.list) {
+                cached.list.forEach(item => {
+                    allResults.push({ ...item, site_key: site.key, site_name: site.name });
+                });
+                return;
+            }
+            try {
+                const searchUrl = `${site.api}?ac=detail&wd=${encodeURIComponent(keyword)}`;
+                const { data } = await fetchWithProxyFallback(searchUrl, { timeout: 8000 }, site.key);
+                const list = data.list ? data.list.map(item => ({
+                    vod_id: item.vod_id,
+                    vod_name: item.vod_name,
+                    vod_pic: item.vod_pic,
+                    vod_play_url: item.vod_play_url,
+                    site_key: site.key,
+                    site_name: site.name
+                })) : [];
+                cacheManager.set('search', cacheKey, { list }, 3600);
+                allResults.push(...list);
+            } catch (err) {
+                console.error(`[Search JSON] ${site.name}:`, err.message);
+            }
+        });
+        await Promise.all(searchPromises);
+        return res.json({ list: allResults });
     }
 
     // SSE 流式模式
@@ -1167,17 +1286,22 @@ app.post('/api/search', async (req, res) => {
 app.get('/api/detail', async (req, res) => {
     const id = req.query.id;
     const siteKey = req.query.site_key;
+    const nocache = req.query.nocache === '1';
     const sites = getDB().sites;
     const site = sites.find(s => s.key === siteKey);
 
     if (!site) return res.status(404).json({ error: 'Site not found' });
 
     const cacheKey = `${siteKey}_detail_${id}`;
-    const cached = cacheManager.get('detail', cacheKey);
-    if (cached) {
-        console.log(`[Cache] Hit detail: ${cacheKey}`);
-        // 返回格式：{ list: [detail] }，与前端期望一致
-        return res.json({ list: [cached] });
+    if (!nocache) {
+        const cached = cacheManager.get('detail', cacheKey);
+        if (cached) {
+            console.log(`[Cache] Hit detail: ${cacheKey}`);
+            // 返回格式：{ list: [detail] }，与前端期望一致
+            return res.json({ list: [cached] });
+        }
+    } else {
+        console.log(`[Detail] nocache=1, 跳过缓存: ${cacheKey}`);
     }
 
     try {
@@ -1486,7 +1610,7 @@ async function renderMediaPage(req, res, mediaType) {
         const rating = data.vote_average ? data.vote_average.toFixed(1) : 'N/A';
         const genres = (data.genres || []).map(g => g.name).join(', ');
         const runtime = data.runtime || (data.episode_run_time && data.episode_run_time[0]) || 0;
-        const siteUrl = process.env.SITE_URL || 'https://ednovas.video';
+        const siteUrl = getSiteUrl(req);
 
         // JSON-LD 结构化数据（让 Google 理解这是电影/电视剧）
         const jsonLd = {
@@ -1595,7 +1719,7 @@ async function renderMediaPage(req, res, mediaType) {
  */
 app.get('/sitemap.xml', async (req, res) => {
     const TMDB_API_KEY = process.env.TMDB_API_KEY;
-    const siteUrl = process.env.SITE_URL || 'https://ednovas.video';
+    const siteUrl = getSiteUrl(req);
     const today = new Date().toISOString().split('T')[0];
 
     let urls = [
