@@ -5751,22 +5751,23 @@
                         for (const k of Object.keys(tomb)) { if (tomb[k] < cutoff) delete tomb[k]; }
                         this._saveTombstones(tomb);
 
-                        // 🔄 服务器优先策略：服务器数据覆盖本地；被墓碑压制的(已删且之后没再看)一律剔除
-                        const newHistory = serverHistory.map(serverItem => serverItem.data).filter(d => !this._isTombstoned(tomb, d));
-
-                        // 💡 本地独有的记录（服务器上没有的、且未被墓碑压制）保留——这是刚添加还没推送的；
-                        //    已删但本地还残留的会被 _isTombstoned 挡掉，不再被当作"本地独有"复活。
-                        const serverNames = new Set(serverHistory.map(item => item.data.name));
-                        const localOnlyItems = this.watchHistory.filter(item => !serverNames.has(item.name) && !this._isTombstoned(tomb, item));
-
-                        if (localOnlyItems.length > 0) {
-                            console.log('[同步] 保留本地独有记录:', localOnlyItems.length, '条');
-                            localOnlyItems.forEach(item => newHistory.push(item));
-                        }
+                        // 🔄 逐条"更新者胜"(last-writer-wins)：同一部剧服务器与本地各有一份时，取 watchedAt 较新的那份。
+                        //    ① 服务器更新(别的设备看到更靠后) → 采纳服务器，修"iPad看16集、手机却续播14集"；
+                        //    ② 本地更新(本机刚看、还没推上去) → 保留本地，不被旧的服务器副本覆盖。
+                        //    被墓碑压制的(已删且之后没再看)一律剔除。
+                        const byName = new Map();
+                        const consider = (d) => {
+                            if (!d || !d.name || this._isTombstoned(tomb, d)) return;
+                            const ex = byName.get(d.name);
+                            if (!ex || new Date(d.watchedAt || 0).getTime() > new Date(ex.watchedAt || 0).getTime()) byName.set(d.name, d);
+                        };
+                        serverHistory.forEach(s => consider(s.data));
+                        this.watchHistory.forEach(consider);  // 本地若比服务器新(刚看未推) → 胜出保留
+                        const newHistory = [...byName.values()];
 
                         // 按时间排序（最新的在前）
                         newHistory.sort((a, b) =>
-                            new Date(b.watchedAt).getTime() - new Date(a.watchedAt).getTime()
+                            new Date(b.watchedAt || 0).getTime() - new Date(a.watchedAt || 0).getTime()
                         );
 
                         // 限制最大条数
@@ -5795,10 +5796,19 @@
                             // 这样播放器能恢复到正确位置（服务器优先模式：直接覆盖本地进度）
                             this.watchHistory.forEach(item => {
                                 if (item.progressTime && item.progressTime > 60) {
-                                    // 生成进度存储 key
+                                    // 生成进度存储 key —— 集名归一化必须与播放器 getProgressKey 完全一致
+                                    // (第01集→第1集、01→1，无集名→正片)，否则同步过来的进度因 key 不符读不到、那一集会从头播。
                                     const name = item.groupData?.name || item.name;
-                                    const combined = (name + '_' + (item.episode || '')).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
-                                    const key = 'donggua_progress_' + combined.substring(0, 80);
+                                    let key;
+                                    if (!item.episode) {
+                                        // 电影(单集)：只用电影名、无集名后缀；前缀计入 80 字截断(与 getProgressKey length===1 一致)。
+                                        key = ('donggua_progress_' + name).replace(/[^a-zA-Z0-9一-龥]/g, '_').substring(0, 80);
+                                    } else {
+                                        // 剧集：电影名 + 标准化集名(第01集→第1集、01→1)。
+                                        const epNorm = String(item.episode).replace(/第0*(\d+)集/g, '第$1集').replace(/^0+(\d)/, '$1') || '正片';
+                                        const combined = (name + '_' + epNorm).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '_');
+                                        key = 'donggua_progress_' + combined.substring(0, 80);
+                                    }
 
                                     // 服务器优先：直接用服务器数据覆盖本地进度
                                     localStorage.setItem(key, JSON.stringify({
@@ -5997,9 +6007,9 @@
                     // 添加到最前面
                     this.watchHistory.unshift(historyItem);
 
-                    // 限制最多保存30条
-                    if (this.watchHistory.length > 30) {
-                        this.watchHistory = this.watchHistory.slice(0, 30);
+                    // 限制最多保存50条(与服务器/pull 上限一致，避免本地是服务器子集时引发误删/反复增删)
+                    if (this.watchHistory.length > 50) {
+                        this.watchHistory = this.watchHistory.slice(0, 50);
                     }
 
                     this.saveWatchHistoryToStorage();
@@ -9488,24 +9498,6 @@
                             }, { passive: true });
                         }
 
-                        // 📱 iOS：原生全屏(webkitEnterFullscreen)会把视频交给系统播放器 → 我们 DOM 上的上下滑手势
-                        //    (音量/亮度/快进退)全部失效，还会被 iOS 自带"上下滑退出全屏"覆盖。把"真全屏"按钮在 iOS 上
-                        //    改走"页面全屏"(CSS 全屏、视频留在 DOM)：手势照常工作、弹幕/自定义控件都在，也没有原生全屏可被误退。
-                        //    (.dplayer-full-icon=真全屏 与 .dplayer-full-in-icon=页面全屏 是兄弟节点，捕获阶段只拦前者、不影响后者)
-                        {
-                            const _ua = navigator.userAgent || '';
-                            const _isiOS = /iPhone|iPad|iPod/.test(_ua) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(_ua));
-                            if (_isiOS) {
-                                container.addEventListener('click', (e) => {
-                                    if (e.target.closest('.dplayer-full-icon') && !e.target.closest('.dplayer-full-in-icon')) {
-                                        e.preventDefault();
-                                        e.stopImmediatePropagation();  // 阻止 DPlayer 进原生全屏
-                                        try { dp.fullScreen.request('web'); } catch (err) { }
-                                    }
-                                }, true);  // 捕获阶段，先于 DPlayer 自己的点击处理器
-                            }
-                        }
-
                         // 双击检测
                         // 双击检测
                         container.addEventListener('touchend', (e) => {
@@ -9792,6 +9784,19 @@
                             // 使用 sendBeacon 确保页面关闭时也能同步
                             this.pushHistoryBeacon();
                         });
+
+                        // 📱 移动端可靠保存：beforeunload 在手机上(切到别的App/锁屏/切后台)常常不触发，导致"刚看到的集/进度"
+                        //    没推到服务器、别的设备同步不到。visibilitychange→hidden 在手机上可靠触发——隐藏时立即保存当前进度
+                        //    并 sendBeacon 推送(beacon 不受节流影响)。守卫只挂一次。
+                        if (!this._historyHiddenHooked) {
+                            this._historyHiddenHooked = true;
+                            document.addEventListener('visibilitychange', () => {
+                                if (document.visibilityState === 'hidden') {
+                                    try { if (dp && dp.video) saveProgress(dp.video.currentTime); } catch (e) { }
+                                    this.pushHistoryBeacon();
+                                }
+                            });
+                        }
 
                         // 播放结束时清除进度记录
                         dp.on('ended', () => {
