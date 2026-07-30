@@ -454,6 +454,12 @@
             padding: 12px 14px;
             color: #fff;
             box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+            /* 📱 面板必须整体待在播放器里:手机竖屏内联播放器只有 ~190px 高,面板(231px)锚 bottom:56px 会把
+               最上面两行(显示弹幕/海量弹幕)顶出播放器外——被上层元素盖住点不到(实测用户手机上正是这两个开关失灵)。
+               限高 + 内部滚动,小屏上滚着用;全屏/横屏高度充裕时不受影响。border-box 让 max-height 含 padding。 */
+            box-sizing: border-box;
+            max-height: calc(100% - 70px);
+            overflow-y: auto;
         }
         #dplayer .dm-set-title {
             font-size: 13px;
@@ -576,6 +582,24 @@
             }
             #dplayer .dplayer-icons .dplayer-icon i {
                 font-size: 20px !important;
+            }
+        }
+
+        /* 📱 窄屏(竖屏手机)：时间挪到进度条上方一行(YouTube 手机版式)。
+           左右两个按钮组是各自绝对定位的(左贴左/右贴右)，右组(下一集/弹幕设置/设置/画中画/网页全屏/全屏)
+           就有 ~276px，加上左侧时间文本在 ≤600px 宽的屏上根本挤不下 → 右组第一个按钮直接压在时间上。
+           把时间抬到进度条上方后，按钮行整行归图标，天然不重叠。 */
+        @media (max-width: 600px) {
+            #dplayer .dplayer-icons.dplayer-icons-left .dplayer-time {
+                position: absolute;
+                left: 0;        /* icons-left 自带 left:20px,这里 0 正好与进度条左缘(20px)对齐 */
+                bottom: 74px;   /* 进度条命中带(bottom:36px+高34px≈顶到70px)之上 */
+                font-size: 12px;
+                line-height: 1;
+                padding: 0;
+                white-space: nowrap;
+                text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+                pointer-events: none;
             }
         }
 
@@ -9111,10 +9135,11 @@
                     const cur = (this.episodeList || []).find(e => e.url === this.currentUrl);
                     const epName = (cur && cur.name) || '';
                     return {
-                        // 末尾 |v2 是缓存版本：CF 曾把"暂时为空"的弹幕响应按 1 年浏览器TTL 缓存进了各用户浏览器(中毒)，
+                        // 末尾 |v3 是缓存版本：CF 曾把"暂时为空"的弹幕响应按 1 年浏览器TTL 缓存进了各用户浏览器(中毒)，
                         // 改 URL 即让旧的中毒缓存 miss、重新拉取。服务器只取 split('|') 的前两段(剧名|集名)，第三段被忽略、
-                        // 不影响匹配与服务器缓存键。将来若再需强制刷新弹幕缓存，把 v2 往上 bump 即可。
-                        id: encodeURIComponent(this.currentGroup.name + '|' + epName + '|v2'),
+                        // 不影响匹配与服务器缓存键。将来若再需强制刷新弹幕缓存，把版本号往上 bump 即可。
+                        // (v2→v3: 修"带年份期号撞任意年份同月日"串台;v3→v4: 综艺匹配16项对抗审查大修后再冲一次缓存)
+                        id: encodeURIComponent(this.currentGroup.name + '|' + epName + '|v4'),
                         api: '/api/danmaku/',
                         user: '观众',
                         // 弹幕显示区域由 CSS(.dplayer-danmaku height:33%)限制到顶部 1/3，
@@ -9129,14 +9154,29 @@
                     if (!this.currentGroup || !this.currentGroup.name) return '';
                     const cur = (this.episodeList || []).find(e => e.url === this.currentUrl);
                     const epName = ((cur && cur.name) || '').trim();
-                    const m = epName.match(/第\s*0*(\d+)\s*[集话話期]/) || epName.match(/\bep\.?\s*0*(\d+)/i) || epName.match(/^0*(\d+)$/);
-                    const num = m ? parseInt(m[1], 10) : null;
+                    const m = epName.match(/第\s*(\d+)\s*[集话話期]/) || epName.match(/\bep\.?\s*(\d+)/i) || epName.match(/^(\d+)$/);
+                    // 数字归一:一般剥前导零(第06集=第6集=06=6);但 ≥4位且0开头的是【日期式】(0624=6月24日),保留原样——
+                    // 否则'第0624期'(日期)与'第624期'(期号)塌缩同键,换源切到碰撞集时不重拉,旧期弹幕铺完全不同的一期(对抗审查实锤)。
+                    const num = m ? ((m[1].length >= 4 && m[1][0] === '0') ? m[1] : String(parseInt(m[1], 10))) : null;
                     // 综艺同一期拆 上/中/下/纯享 等"部分"：键只含期号会塌缩(切"第1期上"→"第1期下"不重拉弹幕)。
-                    // 后缀只取【紧贴 期/集号 token】的部分词(与服务器 danmakuMarkers 同思路)——自由文本副标题("幕后黑手"/"兵临城下")不算,避免误触重拉。
+                    // 对抗审查修的三处(都会导致半集互切/正片↔变体同键不重拉=旧弹幕铺错内容):
+                    //   ①token 也认 EP 形("EP5上"此前整段跳过后缀提取) ②后缀词允许被 括号/连字符/点号 隔开("第1期(上)"/"第1期-下")
+                    //   ③词表补齐服务器 DM_VARIANT/DM_EXTRA 有而这里缺的 plus/片花/reaction/repo,并连取多词("第5期下纯享"≠"第5期下")。
+                    // 自由文本副标题("幕后黑手"/"兵临城下")首词不在白名单即停,不误触重拉。
                     let suf = '';
-                    const tk = epName.match(/第?\s*\d+\s*[集话話期]/);
-                    if (tk) { const sm = epName.slice(tk.index + tk[0].length).match(/^\s*(上|中|下|先导|纯享|加更|特辑|彩蛋|花絮|预告|直拍|发布会|见面会|专场|访谈|饭局)/); if (sm) suf = sm[1]; }
-                    return this.currentGroup.name + '|' + (num != null && !isNaN(num) ? num + suf : epName);
+                    const tk = epName.match(/第?\s*\d+\s*[集话話期]/) || epName.match(/\bep\.?\s*\d+/i);
+                    if (tk) {
+                        let rest = epName.slice(tk.index + tk[0].length);
+                        const SUFW = /^(上|中|下|先导|纯享|加更|特辑|彩蛋|花絮|片花|预告|直拍|发布会|见面会|专场|访谈|饭局|plus|reaction|repo)/i;
+                        for (let g = 0; g < 4; g++) {
+                            rest = rest.replace(/^[\s()（）\[\]【】·:：\-—_~～、.。]+/, '');
+                            const sm = rest.match(SUFW);
+                            if (!sm) break;
+                            suf += sm[1].toLowerCase();
+                            rest = rest.slice(sm[0].length);
+                        }
+                    }
+                    return this.currentGroup.name + '|' + (num != null ? num + suf : epName);
                 },
                 // ========== ⏭️ 跳过片头：按集标记(服务器共享) + 音频指纹自动学习 ==========
                 // 归一剧名(与服务器 introNormTitle 完全一致,改一处必须同步另一处)
@@ -11331,7 +11371,7 @@
                             container.addEventListener('touchstart', (e) => {
                                 _gmode = null;
                                 if (e.touches.length !== 1) return;
-                                if (e.target.closest('.dplayer-controller, .dplayer-setting-box, .dm-settings-panel, .mobile-play-overlay, .dplayer-mask, .dplayer-comment-box, .dplayer-bar-wrap')) return;
+                                if (e.target.closest('.dplayer-controller, .dplayer-setting-box, .dm-settings-panel, .intro-skip-btn, .mobile-play-overlay, .dplayer-mask, .dplayer-comment-box, .dplayer-bar-wrap')) return;
                                 const rect = container.getBoundingClientRect();
                                 _gx = e.touches[0].clientX; _gy = e.touches[0].clientY;
                                 const rx = (_gx - rect.left) / rect.width;
@@ -11377,10 +11417,15 @@
                         container.addEventListener('touchend', (e) => {
                             // 🎚️ 刚完成音量/亮度滑动手势 → 这次抬手不算点击(防止误切控制栏/误判双击)
                             if (_swipeConsumed) { _swipeConsumed = false; return; }
-                            // 忽略控制栏区域和自定义按钮的点击
-                            // 忽略控制栏区域、自定义按钮以及 DPlayer 遮罩的点击
+                            // 忽略控制栏区域、自定义按钮以及 DPlayer 遮罩的点击。
+                            // ⚠️ 此名单必须包含所有【直挂 #dplayer 的可点自定义 UI】——这里 preventDefault 会吃掉浏览器
+                            //    合成的 click,名单外的自定义控件在手机上会"点了没任何反应"(实测事故:弹幕设置面板里
+                            //    显示弹幕/海量弹幕两个开关手机全屏点不动,就是漏了 .dm-settings-panel;跳过片头按钮同理)。
                             if (e.target.closest('.dplayer-controller') ||
                                 e.target.closest('.dplayer-setting-box') ||
+                                e.target.closest('.dm-settings-panel') ||
+                                e.target.closest('.intro-skip-btn') ||
+                                e.target.closest('.dplayer-comment-box') ||
                                 e.target.closest('.mobile-play-overlay') ||
                                 e.target.closest('.dplayer-mask')) {
                                 return;
