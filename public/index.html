@@ -3672,6 +3672,12 @@
             font-weight: 600;
         }
 
+        /* 2K / 4K(实测宽高才会出现):金色 */
+        .src-res.uhd {
+            color: #f5c518;
+            border-color: rgba(245, 197, 24, 0.6);
+        }
+
         .src-geo {
             color: var(--src-unknown);
             border-style: dashed;
@@ -5068,7 +5074,7 @@
                 </div>
             </div>
 
-            <!-- 👥 大家都在看：站内实测观看统计(除自己外有人看过 2 分钟就上榜,只给片名;自己历史记录里有的不显示);不足 4 部整段隐藏 -->
+            <!-- 👥 大家都在看：站内实测观看统计(除自己外至少 2 人各看过 2 分钟才上榜,只给片名;自己历史记录里有的不显示);不足 4 部整段隐藏 -->
             <div v-else-if="k === 'popular'" class="section-container home-sec animate__animated animate__fadeInUp"
                 :class="{ 'home-first': bi === 0 }">
                 <div class="section-header" style="display: flex; align-items: center;">
@@ -6000,7 +6006,7 @@
                                     <span>{{ source.site_name }}</span>
                                     <span class="latency-dot" :class="getLatencyClass(source.latency)"></span>
                                     <span style="font-size:10px; opacity:0.6;">{{ source.latency }}ms</span>
-                                    <span v-if="srcResLabel(source)" class="src-res" :class="{ hd: srcResRank(source) >= 2 }">{{ srcResLabel(source) }}</span>
+                                    <span v-if="srcResLabel(source)" class="src-res" :class="{ hd: srcResRank(source) >= 2, uhd: srcResRank(source) >= 3 }">{{ srcResLabel(source) }}</span>
                                     <span class="src-tag" :class="'t-' + srcGroupOf(source)">{{ srcTierLabel(source) }}</span>
                                     <span v-if="g.tier === 'unreach' && srcProfile(source).geo" class="src-geo">海外受限</span>
                                 </div>
@@ -6996,19 +7002,52 @@
         //    播放器全站复用一个实例,弹幕请求是异步的(第三方匹配常要好几秒)——上一部剧/上一集的请求晚到时,
         //    DPlayer 会照单写进当前弹幕列表。want = 当前播放要的弹幕 id(直播/未开弹幕 = null);
         //    回来的不是 want → 直接丢弃、不回调(DPlayer 什么都不改,也不弹"弹幕加载失败")。
+        // 日期式集名(综艺按播出日期命名):要等视频时长才请求弹幕(见 _dmBackend.read)。须覆盖服务器 danmakuMarkers 认作日期的所有写法
+        //   (scripts/danmaku-match-test.mjs 用真实集名校验);多认几个只是晚一两秒发请求,不碍事。
+        const _dmDatedRe = /(?:^|\D)(?:19|20)\d{6}(?!\d)|\d{4}\s*[-./年]\s*\d{1,2}|(?:^|\D)\d{6}(?!\d)|(?:^|\D)\d{4}\s*期|\d{1,2}\s*月\s*\d{1,2}/;
         const _dmBackend = {
             want: null,
+            seq: 0,       // 每次 read 递增,只有最新的那次可以在等时长
+            key: '',      // 当前弹幕对应的 _danmakuKey(play() 设)
+            sent: null,   // 日期式集名最近一次发出去的 { id, d:时长, key }
             read(o) {
                 const m = /[?&]id=([^&]*)/.exec(o.url || '');
                 const id = m ? m[1] : '';
-                fetch(o.url, { credentials: 'same-origin' })
+                const seq = ++_dmBackend.seq;
+                // 已换剧/换集/进直播(want 变了),或之后又重载过弹幕(有更新的一次 read)→ 晚到的旧弹幕不要
+                const stale = () => id !== _dmBackend.want || seq !== _dmBackend.seq;
+                const go = url => fetch(url, { credentials: 'same-origin' })
                     .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
                     .then(d => {
-                        if (id !== _dmBackend.want) return;   // 已换剧/换集/进直播 → 晚到的旧弹幕不要
-                        if (d && d.code === 0) { if (o.success) o.success((d.data || []).map(e => ({ time: e[0], type: e[1], color: e[2], author: e[3], text: e[4] }))); }
+                        if (stale()) return;
+                        if (d && d.code === 0) {
+                            if (o.success) o.success((d.data || []).map(e => ({ time: e[0], type: e[1], color: e[2], author: e[3], text: e[4] })));
+                            // 列表晚到时 DPlayer 的读指针还在 0:下一帧会把"当前时间之前"的弹幕一口气全画出来(实测开海量一帧 8 秒)→ 对到当前时间
+                            try { if (typeof dp !== 'undefined' && dp && dp.danmaku && dp.video && (dp.video.currentTime || 0) > 1) dp.danmaku.seek(); } catch (e) { }
+                        }
                         else if (o.error) o.error(d && d.msg);
                     })
-                    .catch(e => { if (id !== _dmBackend.want) return; console.error(e); if (o.error) o.error(); });
+                    .catch(e => { if (stale()) return; console.error(e); if (o.error) o.error(); });
+                // 📅 综艺日期式集名(第20261010期):等拿到视频时长再请求,id 后面带上 d:秒——服务器在腾讯那一天的全部条目里按
+                //    "时长对得上 + 类别相容"认出是哪一条(server.js danmakuAirDatePick);别的集名照旧马上请求。want 比对用原 id(时长只拼在请求地址上)。
+                //    每秒看一次当前 #dplayer video 的时长(播放器重建、换源换了 <video> 也跟得上);换了剧/集(want 变了)就不发了。
+                //    一直拿不到时长(一小时)就当没有弹幕——不退回不带时长的请求(那条路对日期式综艺常配错)。
+                //    DPlayer 换片源时先改 src 再重载弹幕,此刻 duration 已是 NaN,拿不到上一集的时长。正则别用后行断言(旧 iOS Safari 整段脚本会解析失败)。
+                //    每次 read 领一个序号(seq),只有最新的那次在等(同一集反复开/快速来回切不会叠出好几个等待、发好几遍)。
+                //    发出去时记下 {id, d, key}:同键换源/换集时播放页拿新视频的时长跟它比,差得多就重载(见 _dmRecheckDuration)。
+                let ep = '';
+                try { ep = decodeURIComponent(id).split('|')[1] || ''; } catch (e) { }
+                if (!_dmDatedRe.test(ep)) return go(o.url);
+                const t0 = Date.now(), key = _dmBackend.key;
+                const tick = () => {
+                    if (stale()) return;
+                    const v = document.querySelector('#dplayer video');
+                    const d = (v && isFinite(v.duration) && v.duration >= 30) ? Math.round(v.duration) : 0;
+                    if (d) { _dmBackend.sent = { id, d, key }; return go(o.url.replace(/([?&]id=[^&]*)/, '$1' + encodeURIComponent('|d:' + d))); }
+                    if (Date.now() - t0 > 3600e3) { if (o.success) o.success([]); return; }   // 一小时还没时长:收起"弹幕加载中"
+                    setTimeout(tick, 1000);
+                };
+                setTimeout(tick, 200);
             },
             send(o) {
                 fetch(o.url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(o.data) })
@@ -7196,6 +7235,7 @@
                 player.plugins.hls = hls;
                 try { if (cutSess) window.adCut.hook(hls, cutSess); } catch (e) { }
                 try { if (window.adClipSkip) window.adClipSkip.attach(hls, video); } catch (e) { }   // 🛡️ 去插播:必须在 loadSource 前挂(要收 MANIFEST_PARSED)
+                try { hls.on(Hls.Events.MANIFEST_PARSED, (ev, d) => { try { if (window.vueApp && window.vueApp._srcNoteLevels) window.vueApp._srcNoteLevels(hls.url, d && d.levels); } catch (e) { } }); } catch (e) { }   // 📐 真实分辨率
                 hls.loadSource(video.src);
                 hls.attachMedia(video);
                 player.events.on('destroy', () => { try { hls.destroy(); } catch (e) { } if (player.plugins.hls === hls) delete player.plugins.hls; });
@@ -10449,7 +10489,7 @@
                     const metaOf = new Map();
                     this.playableSources.forEach(s => {
                         const p = this.srcProfile(s);
-                        metaOf.set(s, [SRC_TIER_RANK[p.tier], this._srcResRankOf(p.res)]);
+                        metaOf.set(s, [SRC_TIER_RANK[p.tier], this._srcResRankOf(this._srcResOf(s, p))]);
                         const gid = (this._srcUnreach(s) || p.tier === 'unknown') ? 'unreach' : SRC_TIER_GROUP[p.tier];
                         (by[gid] = by[gid] || []).push(s);
                     });
@@ -12607,14 +12647,134 @@
                 srcTierRank(s) { return SRC_TIER_RANK[this.srcProfile(s).tier]; },
                 _srcResRankOf(res) {
                     const r = String(res || '').toLowerCase();
-                    return (r.indexOf('4k') >= 0 || r.indexOf('2160') >= 0) ? 3 : r.indexOf('1080') >= 0 ? 2 : r.indexOf('720') >= 0 ? 1 : 0;
+                    return (r.indexOf('4k') >= 0 || r.indexOf('2160') >= 0) ? 4 : (r.indexOf('2k') >= 0 || r.indexOf('1440') >= 0) ? 3 :
+                        r.indexOf('1080') >= 0 ? 2 : r.indexOf('720') >= 0 ? 1 : 0;
                 },
-                srcResRank(s) { return this._srcResRankOf(this.srcProfile(s).res); },
+                srcResRank(s) { return this._srcResRankOf(this._srcResOf(s)); },
                 srcResLabel(s) {
-                    const r = String(this.srcProfile(s).res || '').toLowerCase();
+                    const r = String(this._srcResOf(s) || '').toLowerCase();
                     if (!r) return '';
                     const k = this._srcResRankOf(r);
-                    return k === 3 ? '4K' : k === 2 ? '1080P' : k === 1 ? '720P' : '标清';
+                    return k === 4 ? '4K' : k === 3 ? '2K' : k === 2 ? '1080P' : k === 1 ? '720P' : '标清';
+                },
+                // 📐 真实分辨率:档案里的 res 是"这个站一般是多少"(站点级、手填);资源站片名/分类写的"4K"多数实为 1080P。
+                //   这里优先用【这部剧实测】的宽高:测速拉到的主清单 RESOLUTION(_srcNoteRes),主清单没写的由播放中的画面尺寸补
+                //   (_srcResSniffPlay)。按 站点|vod_id 记在本机(donggua_src_res,30 天),测速缓存命中跳过测速时也能显示。
+                //   按长边/短边分档:宽银幕 3840×1600 仍是 4K,1920×800 仍是 1080P,竖屏 1080×1920 是 1080P
+                _resTagOf(w, h) {
+                    w = +w || 0; h = +h || 0;
+                    if (!w || !h) return '';
+                    const L = Math.max(w, h), S = Math.min(w, h);
+                    return (L >= 3200 || S >= 2000) ? '4k' : (L >= 2400 || S >= 1400) ? '2k' : (L >= 1800 || S >= 1000) ? '1080p' : (L >= 1200 || S >= 700) ? '720p' : 'sd';
+                },
+                _srcResMemo() {
+                    if (!this._resMemo) {
+                        let m = null;
+                        try { m = JSON.parse(localStorage.getItem('donggua_src_res') || 'null'); } catch (e) { }
+                        this._resMemo = (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
+                    }
+                    return this._resMemo;
+                },
+                _srcRealRes(s) {
+                    if (!s) return null;
+                    if (s._realRes && s._realRes.w) return s._realRes;
+                    if (!s.site_key || s.vod_id == null) return null;
+                    const r = this._srcResMemo()[s.site_key + '|' + s.vod_id];
+                    return (r && r.w && r.h) ? r : null;
+                },
+                _srcResOf(s, p) {
+                    const r = this._srcRealRes(s);
+                    return r ? this._resTagOf(r.w, r.h) : (p || this.srcProfile(s)).res;
+                },
+                // 记一条线路的实测宽高(from:'m3u8' 主清单 | 'play' 播放画面)。主清单写了的不被播放画面覆盖(画面可能正好是插播)
+                _srcSetRes(s, w, h, from) {
+                    w = Math.round(+w || 0); h = Math.round(+h || 0);
+                    if (!s || w < 64 || h < 64 || w > 16384 || h > 16384) return;
+                    const old = this._srcRealRes(s);
+                    if (old && old.from === 'm3u8' && from !== 'm3u8') return;
+                    const r = { w: w, h: h, from: from, ts: Date.now() };
+                    s._realRes = r;
+                    if (s.site_key && s.vod_id != null) {
+                        const m = this._srcResMemo(), now = Date.now(), TTL = 30 * 24 * 3600 * 1000;
+                        m[s.site_key + '|' + s.vod_id] = r;
+                        const ks = Object.keys(m);
+                        ks.forEach(k => { if (!m[k] || now - (m[k].ts || 0) > TTL) delete m[k]; });
+                        const left = Object.keys(m);
+                        if (left.length > 600) left.sort((a, b) => (m[a].ts || 0) - (m[b].ts || 0)).slice(0, left.length - 600).forEach(k => { delete m[k]; });
+                        try { localStorage.setItem('donggua_src_res', JSON.stringify(m)); } catch (e) { }
+                    }
+                    if (!old || old.w !== w || old.h !== h) this.srcRev++;
+                },
+                // 测速拿到的清单正文:主清单(EXT-X-STREAM-INF)取 RESOLUTION 最大的一档;媒体清单没有分辨率信息,不动
+                _srcNoteRes(s, text) {
+                    try {
+                        if (!text || !/#EXT-X-STREAM-INF/i.test(text)) return;
+                        const re = /#EXT-X-STREAM-INF:[^\n]*?RESOLUTION=(\d+)x(\d+)/gi;
+                        let m, best = null;
+                        while ((m = re.exec(text))) { const w = +m[1], h = +m[2]; if (!best || w * h > best.w * best.h) best = { w: w, h: h }; }
+                        if (best) this._srcSetRes(s, best.w, best.h, 'm3u8');
+                    } catch (e) { }
+                },
+                // hls.js 的 MANIFEST_PARSED:主清单各档宽高 → 记到正在播的线路。地址要对得上 currentUrl(直连或代理里编码的),
+                //   换源途中旧实例晚到的清单不算
+                _srcNoteLevels(url, levels) {
+                    const s = this.currentSource, cur = this.currentUrl;
+                    if (!s || !cur || !url || !Array.isArray(levels) || !levels.length) return;
+                    if (url !== cur && url.indexOf(encodeURIComponent(cur)) < 0) return;
+                    let best = null;
+                    levels.forEach(l => { const w = +(l && l.width) || 0, h = +(l && l.height) || 0; if (w && h && (!best || w * h > best.w * best.h)) best = { w: w, h: h }; });
+                    if (best) this._srcSetRes(s, best.w, best.h, 'm3u8');
+                },
+                // 测速缓存命中的线路没拉过清单 → 没有分辨率。起播稳定后(8s)在后台补读它们的首集主清单:搜索结果自带选集,
+                //   每条只多一个几百字节的文本请求,2 并发、5s 超时;换剧即停;媒体清单(没写分辨率)本会话不再问
+                _srcResBackfill(sources, seq) {
+                    clearTimeout(this._resBackfillTimer);
+                    this._resBackfillTimer = setTimeout(async () => {
+                        if (seq !== _navSeq) return;
+                        const tried = this._resTried || (this._resTried = new Set());
+                        const todo = (sources || []).filter(s => s && !this._isKzSource(s) && s.vod_play_url && typeof s.latency === 'number' && s.latency < 9000 &&
+                            (s._testType === 'direct' || s._testType === 'proxy') && !this._srcRealRes(s) && !tried.has(s.site_key + '|' + s.vod_id));
+                        const one = async (s) => {
+                            if (seq !== _navSeq) return;
+                            tried.add(s.site_key + '|' + s.vod_id);
+                            let pu = String(s.vod_play_url || '');
+                            if (pu.includes('$$$')) { const sets = pu.split('$$$'); pu = sets.find(x => x.toLowerCase().includes('m3u8')) || sets[0]; }
+                            const parts = pu.split('#')[0].split('$');
+                            const u = parts.length > 1 ? parts[1] : parts[0];
+                            if (!u || !/^https?:/.test(u) || this._isKzUrl(u) || (location.protocol === 'https:' && u.startsWith('http:'))) return;
+                            const viaProxy = s._useProxy && (s._proxyUrl || this.corsProxyUrl);
+                            const fu = viaProxy ? (s._proxyUrl || this.corsProxyUrl) + '/?url=' + encodeURIComponent(u) : u;
+                            const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+                            try {
+                                const r = await fetch(fu, { cache: 'no-cache', signal: ctl.signal });
+                                if (r.ok) this._srcNoteRes(s, await r.text());
+                            } catch (e) { } finally { clearTimeout(t); }
+                        };
+                        let i = 0;
+                        const worker = async () => { while (i < todo.length && seq === _navSeq) await one(todo[i++]); };
+                        await Promise.all([worker(), worker()]);
+                    }, 8000);
+                },
+                // 播放中补测(主清单没写分辨率的线路):播过 2 分钟后取画面尺寸,隔 1 分钟再看一次一样才记(避开片头插播/中插)
+                _srcResSniffPlay() {
+                    try {
+                        const v = (typeof dp !== 'undefined' && dp) ? dp.video : null;
+                        const s = this.currentSource;
+                        if (!v || !s || this._liveActive || (this._isCasting && this._isCasting())) return;
+                        const t = v.currentTime || 0;
+                        if (t < 120 || !v.videoWidth || !v.videoHeight) return;
+                        const known = this._srcRealRes(s);
+                        if (known && known.from === 'm3u8') return;
+                        const key = (s.site_key || '') + '|' + (s.vod_id == null ? '' : s.vod_id) + '|' + (this.currentUrl || '');
+                        const c = this._resSniff;
+                        const dims = v.videoWidth + 'x' + v.videoHeight;
+                        if (!c || c.key !== key) { this._resSniff = { key: key, dims: dims, t: t, done: false }; return; }
+                        if (c.done) return;
+                        if (c.dims !== dims) { c.dims = dims; c.t = t; return; }
+                        if (t - c.t < 60) return;
+                        c.done = true;
+                        this._srcSetRes(s, v.videoWidth, v.videoHeight, 'play');
+                    } catch (e) { }
                 },
                 // 徽章用的显示分组(clean/insert/unknown/ads;noburn 去广告生效时与 clean 同显示为"无广告")
                 srcGroupOf(s) { return SRC_TIER_GROUP[this.srcProfile(s).tier]; },
@@ -12628,6 +12788,8 @@
                     if (this._srcUnreach(s)) parts.push(SRC_GROUP_BY_ID.unreach.desc);
                     else if (p.geo) parts.push('海外受限：部分地区网络可能无法播放');
                     if (p.codec === 'hevc' && !this._srcHevcOk()) parts.push('H.265 编码：本机浏览器可能无法解码，不会自动选用');
+                    const rr = this._srcRealRes(s);
+                    if (rr) parts.push('分辨率 ' + rr.w + '×' + rr.h + (rr.from === 'play' ? '（播放实测）' : '（片源清单）'));
                     return parts.join('；');
                 },
                 // 本机 MSE 能否解 HEVC(H.265),只探一次。Firefox、不少 Linux/Android Chrome、无硬解的旧 Windows 都不行 ——
@@ -12685,7 +12847,8 @@
                     //   3100ms 含广告 vs 8900ms 无广告会挑那条勉强能通的慢线,慢网用户起播更慢
                     const pool = ok.length ? ok : cands.filter(s => s.latency <= lim);
                     const meta = new Map();
-                    pool.forEach(s => { const p = this.srcProfile(s); meta.set(s, [SRC_TIER_RANK[p.tier], this._srcResRankOf(p.res)]); });
+                    // 分辨率只比到 1080P:2K/4K 码率高,弱网/手机自动起到 4K 容易卡,想看 4K 手动点
+                    pool.forEach(s => { const p = this.srcProfile(s); meta.set(s, [SRC_TIER_RANK[p.tier], Math.min(2, this._srcResRankOf(this._srcResOf(s, p)))]); });
                     return pool.slice().sort((a, b) => {
                         const ma = meta.get(a), mb = meta.get(b);
                         return (ma[0] - mb[0]) || (mb[1] - ma[1]) || (a.latency - b.latency);
@@ -15615,6 +15778,7 @@
                         return source;
                     };
                     await runWithConcurrency(misses, 6, testWorker);
+                    this._srcResBackfill(this.currentGroup && this.currentGroup.sources, _openSeq);   // 📐 缓存命中没测速的线路补读分辨率
                     clearTimeout(earlyReturnTimer);
                     clearTimeout(lateReturnTimer);
                     clearTimeout(earlySettleTimer);   // 完成路径自己选源且不置 hasAutoSelected:残留的复查定时器必须清掉,否则会再切一次
@@ -16248,11 +16412,33 @@
                         unlimited: false
                     };
                 },
+                // 📅 同键换源/换集(没重载弹幕)时:日期式集名的弹幕是服务器按"那天腾讯条目里时长对得上"认的(server.js danmakuAirDatePick),
+                //    同名的另一条剪辑(资源站同一天两条同名、或换到别的站)时长不同就该是别的弹幕。拿到新视频时长后与上次请求用的时长比,
+                //    差出 3%(至少 30s,不同站同一条片源差几十秒以内)就按新时长重载;还在等时长的那次请求会自己用新视频的时长,不用管。
+                //    只认发起它的那次播放:换集/换剧/进直播(play() 的重载、丢弃分支会作废它)后不再动弹幕(对抗审查:曾把上一集的弹幕重载回新视频)。
+                _dmRecheckDuration(opt, key) {
+                    const s = _dmBackend.sent;
+                    if (!opt || !s || s.key !== key || s.id !== _dmBackend.want) return;
+                    const tok = this._dmRecheckTok = (this._dmRecheckTok || 0) + 1, pt = this._playToken, t0 = Date.now();
+                    const tick = () => {
+                        if (tok !== this._dmRecheckTok || this._playToken !== pt || _dmBackend.sent !== s || _dmBackend.want !== s.id || _dmBackend.key !== key
+                            || typeof dp === 'undefined' || !dp || !dp.danmaku) return;
+                        const v = document.querySelector('#dplayer video');
+                        const d = (v && isFinite(v.duration) && v.duration >= 30) ? Math.round(v.duration) : 0;
+                        if (!d) { if (Date.now() - t0 < 120000) setTimeout(tick, 1000); return; }
+                        if (Math.abs(d - s.d) <= Math.max(30, s.d * 0.03)) return;
+                        _dmBackend.want = opt.id;
+                        _dmBackend.key = key;
+                        try { dp.danmaku.reload({ id: opt.id, address: opt.api, user: opt.user }); } catch (e) { }
+                    };
+                    setTimeout(tick, 200);
+                },
                 // 🗨️ 本次播放不带弹幕(直播/未开弹幕):把复用播放器里上一部剧的弹幕【整份】丢掉。
                 //    DPlayer 的 danmaku.clear() 只清屏、不清列表(dan),还把读指针归零 → 旧列表按新视频的时间从头重放
                 //    (实测:看完《兰香如故》进 CCTV9 直播,满屏兰香如故的弹幕)。在飞的旧请求由 _dmBackend.want=null 作废。
                 _danmakuDrop() {
                     _dmBackend.want = null;
+                    this._dmRecheckTok = (this._dmRecheckTok || 0) + 1;   // 作废还在等时长的同键重查(见 _dmRecheckDuration)
                     this._lastDanmakuKey = null;   // 列表已丢:回到原来那集要重新拉
                     try {
                         if (typeof dp === 'undefined' || !dp || !dp.danmaku) return;
@@ -16305,7 +16491,18 @@
                     if (!this.currentGroup || !this.currentGroup.name) return '';
                     const cur = (this.episodeList || []).find(e => e.url === this.currentUrl);
                     const epName = ((cur && cur.name) || '').trim();
-                    const m = epName.match(/第\s*(\d+)\s*[集话話期]/) || epName.match(/\bep\.?\s*(\d+)/i) || epName.match(/^(\d+)$/);
+                    // 📅 日期式集名(综艺):键 = 日期 + 日期之外的全部文字(去分隔符、数字去前导零)。同一天常有 正片/捣蛋/纯享/上下半/加更 好几条,
+                    //    以前只认期号 + 白名单后缀,"第20261010期"和"第20261010期捣蛋"同键 → 切过去不重拉弹幕(对抗审查实锤);
+                    //    写法不同的同一条(第20261010期 / 20261010 / 2026-10-10)仍同键。
+                    let dm = epName.match(/(?:^|\D)((?:19|20)\d{6})(?!\d)/), dkey = '', dtxt = '';
+                    if (dm) { dkey = dm[1]; dtxt = dm[1]; }
+                    else if ((dm = epName.match(/((?:19|20)\d{2})\s*[-./年]\s*(\d{1,2})\s*[-./月]\s*(\d{1,2})\s*日?/))) { dkey = dm[1] + dm[2].padStart(2, '0') + dm[3].padStart(2, '0'); dtxt = dm[0]; }
+                    if (dkey) {
+                        const rest = epName.replace(dtxt, '\u0000').replace(/第?\s*\u0000\s*期?/, '')
+                            .replace(/[\s()（）\[\]【】·:：\-—_~～、.。]+/g, '').replace(/\d+/g, x => String(parseInt(x, 10))).toLowerCase();
+                        return this.currentGroup.name + '|' + dkey + '|' + rest;
+                    }
+                    const m =epName.match(/第\s*(\d+)\s*[集话話期]/) || epName.match(/\bep\.?\s*(\d+)/i) || epName.match(/^(\d+)$/);
                     // 数字归一:一般剥前导零(第06集=第6集=06=6);但 ≥4位且0开头的是【日期式】(0624=6月24日),保留原样——
                     // 否则'第0624期'(日期)与'第624期'(期号)塌缩同键,换源切到碰撞集时不重拉,旧期弹幕铺完全不同的一期(对抗审查实锤)。
                     const num = m ? ((m[1].length >= 4 && m[1][0] === '0') ? m[1] : String(parseInt(m[1], 10))) : null;
@@ -16546,6 +16743,7 @@
                             try {
                                 const txt = await testRes.clone().text();   // 中止计时器仍在:正文卡住 5s 照样中止
                                 clearTimeout(timeoutId);
+                                this._srcNoteRes(source, txt);
                                 tBody = Date.now() - startTime;
                                 bodyOK = await this._m3u8HasFragments(txt, videoUrl);
                                 tAll = Date.now() - startTime;
@@ -16578,6 +16776,7 @@
                                 try {
                                     const ptxt = await proxyTestRes.clone().text();
                                     clearTimeout(proxyTimeoutId);
+                                    this._srcNoteRes(source, ptxt);
                                     ptBody = Date.now() - proxyStartTime;
                                     proxyBodyOK = await this._m3u8HasFragments(ptxt, proxyUrl);
                                     ptAll = Date.now() - proxyStartTime;
@@ -17247,7 +17446,9 @@
                     if (danmakuOpt) this._lastDanmakuKey = danmakuKey;
                     // 本次播放不带弹幕(直播/未开弹幕)→ 上一部的弹幕整份丢掉;要加载新弹幕(新建播放器/换集)→ 只收这一份
                     if (!danmakuOpt) this._danmakuDrop();
-                    else if (!dp || danmakuReload) _dmBackend.want = danmakuOpt.id;
+                    else if (!dp || danmakuReload) { _dmBackend.want = danmakuOpt.id; _dmBackend.key = danmakuKey; this._dmRecheckTok = (this._dmRecheckTok || 0) + 1; }
+                    // 📅 同键(不重载)但可能是另一条剪辑:日期式集名的弹幕是按视频时长认的,拿到新视频时长后跟上次请求用的比,差得多就重载
+                    else if (dp && dp.danmaku) this._dmRecheckDuration(danmakuOpt, danmakuKey);
 
                     if (!dp) {
                         console.log('[播放器] 创建新的 DPlayer 实例');
@@ -18694,6 +18895,7 @@
                                     if (dp.video && window.adClipSkip && window.adClipSkip.check(dp.video.currentTime)) return;
                                     if (dp.video && window.skipManager) window.skipManager.check(dp.video.currentTime);
                                     this._maybePreloadNext();  // ⏭️ 临近结尾时预加载下一集(内部有节流/守卫)
+                                    this._srcResSniffPlay();   // 📐 主清单没写分辨率的线路:按播放画面补测
                                 });
 
                                 dp.on('canplay', () => {
